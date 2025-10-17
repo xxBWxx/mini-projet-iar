@@ -64,7 +64,8 @@ We further report paired $t$-tests and Pearson correlations to assess statistica
   \caption{Learning curves (mean return vs timesteps). Shaded regions show 95\% CI across random seeds.}
 \end{figure}
 
-TD3 consistently outperforms DDPG both in terms of sample efficiency and asymptotic performance. While DDPG exhibits higher variance and occasional divergence, TD3 shows smoother and more monotonic improvement.
+In our 10 k-step experiments, DDPG achieved higher mean returns and more stable learning than TD3.
+TD3 initially improved faster but later degraded, possibly due to the limited training budget and slower critic convergence.
 
 Table~\ref{tab:performance} summarizes key performance statistics (mean $\pm$ 95\% CI) and paired $t$-tests.
 
@@ -89,14 +90,18 @@ TD3  & $XXX \pm XXX$ & $XXX \pm XXX$ & $p = XXX$ \\
   \caption{Mean per-step bias across episodes (lower is better).}
 \end{figure}
 
-The estimated bias distributions show a clear difference: DDPG’s single critic tends to overestimate returns, while TD3’s clipped double critic drastically reduces this effect. One-sample $t$-tests confirm that DDPG’s mean bias is significantly positive ($p < 0.01$), while TD3’s $\min(Q_1,Q_2)$ bias is statistically indistinguishable from zero ($p > 0.1$). A paired test between the two algorithms yields $p < 0.01$, confirming TD3’s reduction of bias.  
+The estimated bias distributions show a clear difference: DDPG’s single critic tends to produce much higher positive bias, while TD3’s clipped double critic substantially reduces this effect. Both algorithms still exhibit over-estimation ($\text{bias} > 0$), but TD3’s mean bias is roughly half that of DDPG (see Fig.~\ref{fig:bias}). Statistical tests confirm that both biases are significantly greater than zero ($p < 0.01$), and a paired $t$-test indicates that TD3’s bias is significantly lower than DDPG’s ($p < 0.05$).  
 
-Finally, the correlation between bias magnitude and episode return is weakly negative ($r=-0.45$ for DDPG, $r=-0.32$ for TD3), suggesting that stronger bias generally corresponds to poorer performance.
+Overall, this supports the theoretical claim that TD3 mitigates over-estimation bias, although it does not completely eliminate it. In our short training runs, the reduction in bias did not directly translate into improved returns, suggesting that longer training or different hyperparameters might be required for TD3 to realize its performance benefits.
+
 
 \section{Discussion}
-Our experiments support the original motivation of TD3: double critics and delayed policy updates significantly improve stability and accuracy of $Q$-value estimates. Reducing over-estimation bias not only stabilizes critic learning but also indirectly benefits the actor by providing more reliable gradients.
+Our experiments support the original motivation of TD3: double critics and delayed policy updates improve the stability and accuracy of $Q$-value estimates. Reducing over-estimation bias helps stabilize critic learning and provides more reliable gradients to the actor.
 
-However, bias is not completely eliminated. Even TD3 shows small fluctuations, likely due to function approximation errors and non-stationarity from off-policy sampling. Moreover, some runs of DDPG achieve competitive performance, highlighting the high variance and sensitivity of deep RL.
+However, bias is not completely eliminated. Even TD3 shows small fluctuations, likely due to function approximation errors and non-stationarity from off-policy sampling. Moreover, some DDPG runs achieve competitive performance, highlighting the high variance and sensitivity of deep RL.
+
+Although TD3 theoretically mitigates over-estimation bias, our short-run results show that reduced bias does not always yield immediate performance gains. A longer training budget or more extensive hyperparameter tuning may be required for TD3 to realize its full advantages on LunarLanderContinuous-v3.
+
 
 \subsection{Limitations and Future Work}
 The study is limited by:
