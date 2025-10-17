@@ -1,1 +1,21 @@
+# --- Reinforcement Learning ---
+stable-baselines3
 gymnasium[box2d]
+torch
+numpy
+scipy
+cloudpickle
+
+# --- Visualization and Analysis ---
+matplotlib
+pandas
+tqdm
+rich
+tensorboard
+
+# --- Optional but useful ---
+pygame   
+box2d-py
+swig
+protobuf
+Werkzeug

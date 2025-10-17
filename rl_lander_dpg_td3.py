@@ -1,6 +1,5 @@
 import os
 import numpy as np
-
 import gymnasium as gym
 from gymnasium.wrappers import TimeLimit
 from stable_baselines3 import DDPG, TD3
@@ -28,7 +27,7 @@ def make_env(seed=SEED):
     def _thunk():
         env = gym.make(ENV_ID)
         env = TimeLimit(env, max_episode_steps=1000)
-        env.reset(seed=seed)
+        env.reset(seed=int(seed))
         env.action_space.seed(seed)
         env = Monitor(env)
         return env
@@ -83,14 +82,18 @@ def train_model(alg: str, logdir: str, timesteps: int) -> Tuple[object, str]:
     else:
         raise ValueError("alg must be 'DDPG' or 'TD3'")
 
-    # evaluate while training
     eval_env = make_env(SEED + 1)()
+
+    # pick an eval freq that always triggers (at least once) before training ends
+    effective_eval_freq = max(1, min(10_000, max(1, timesteps // 5)))
+
     stop_cb = StopTrainingOnRewardThreshold(reward_threshold=200, verbose=1)
+
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path=os.path.join(logdir, f"{alg}_best"),
         log_path=os.path.join(logdir, f"{alg}_eval"),
-        eval_freq=10_000,
+        eval_freq=effective_eval_freq,
         n_eval_episodes=5,
         deterministic=True,
         callback_on_new_best=stop_cb,
@@ -98,55 +101,100 @@ def train_model(alg: str, logdir: str, timesteps: int) -> Tuple[object, str]:
 
     model.learn(total_timesteps=timesteps, callback=eval_cb)
 
-    model.save(os.path.join(logdir, f"{alg}_final"))
+    save_path = os.path.join(logdir, f"{alg}_final")
+    model.save(save_path)
     env.close()
     eval_env.close()
-    return model, os.path.join(logdir, f"{alg}_final.zip")
+    return model, f"{save_path}.zip"
 
 
 @torch.no_grad()
 def critic_q_estimate(model, obs: np.ndarray, act: np.ndarray):
     """
-    Returns:
-      - For DDPG: single Q estimate (N,)
-      - For TD3: (q1, q2, q_min) each (N,)
-    Works with SB3 >= 1.8 style modules.
+    Works with SB3 2.7+ and older:
+    - For TD3: returns (q1, q2, qmin)
+    - For DDPG: returns q
     """
     device = model.device
-    obs_t = torch.as_tensor(obs).float().to(device)
-    act_t = torch.as_tensor(act).float().to(device)
+    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+    act_t = torch.as_tensor(act, dtype=torch.float32, device=device)
+    if act_t.ndim == 1:
+        act_t = act_t.unsqueeze(-1)
 
-    # DDPG: model.critic
-    # TD3: model.critic, model.critic_target with two Q nets internally; expose via forward with return both
-    try:
-        # TD3 exposes two critics inside model.critic
-        out = model.critic(obs_t, act_t)
-        if isinstance(out, tuple) or (hasattr(out, "__len__") and len(out) == 2):
-            q1, q2 = out
-            q1 = q1.flatten().cpu().numpy()
-            q2 = q2.flatten().cpu().numpy()
-            return q1, q2, np.minimum(q1, q2)
+    policy = model.policy
+
+    # === Get the correct feature extractor ===
+    # TD3/DDPG in SB3 2.x store extractors inside actor/critic
+    features_extractor = getattr(policy, "features_extractor", None)
+    if features_extractor is None:
+        if hasattr(policy, "actor") and hasattr(policy.actor, "features_extractor"):
+            features_extractor = policy.actor.features_extractor
+        elif hasattr(model, "critic") and hasattr(model.critic, "features_extractor"):
+            features_extractor = model.critic.features_extractor
         else:
-            q = out.flatten().cpu().numpy()
+            raise RuntimeError(
+                "Could not find any features_extractor in policy or critic"
+            )
+
+    # === Extract features ===
+    # This always works with both SB3 2.7 and older.
+    preprocessed_obs = policy.obs_to_tensor(obs_t)[0]  # preprocess via policy
+    features = features_extractor(preprocessed_obs)
+    if isinstance(features, tuple):
+        features = torch.cat([f for f in features if torch.is_tensor(f)], dim=1)
+
+    # === Combine features and actions ===
+    q_input = torch.cat([features, act_t], dim=1)
+
+    critic = getattr(model, "critic", None)
+    if critic is None:
+        raise RuntimeError("Model has no critic module")
+
+    # === TD3: two Q networks ===
+    if hasattr(critic, "q_networks"):
+        qnets = critic.q_networks
+        if len(qnets) == 1:  # DDPG
+            q = qnets[0](q_input).squeeze(-1).detach().cpu().numpy()
             return q
-    except Exception:
-        if hasattr(model.policy, "q_net"):
-            q = model.policy.q_net(obs_t, act_t).flatten().cpu().numpy()
-            return q
-        q1 = model.policy.qf1(obs_t, act_t).flatten().cpu().numpy()
-        q2 = model.policy.qf2(obs_t, act_t).flatten().cpu().numpy()
+        else:  # TD3
+            q1 = qnets[0](q_input).squeeze(-1).detach().cpu().numpy()
+            q2 = qnets[1](q_input).squeeze(-1).detach().cpu().numpy()
+            return q1, q2, np.minimum(q1, q2)
+
+    # === Older SB3 fallback ===
+    if hasattr(critic, "qf1") and hasattr(critic, "qf2"):
+        q1 = critic.qf1(q_input).squeeze(-1).detach().cpu().numpy()
+        q2 = critic.qf2(q_input).squeeze(-1).detach().cpu().numpy()
         return q1, q2, np.minimum(q1, q2)
+    if hasattr(policy, "q_net"):
+        q = policy.q_net(q_input).squeeze(-1).detach().cpu().numpy()
+        return q
+
+    raise RuntimeError("Could not access critics for this SB3 version (TD3/DDPG).")
+
+
+def to_pyint(x):
+    """Convert numpy scalars / python ints to a built-in int."""
+    # handles np.int64, np.int32, numpy scalar arrays, etc.
+    return int(np.asarray(x).item())
 
 
 def rollout_and_bias(model, episodes=10, gamma=GAMMA, seed=SEED + 123):
     """Run deterministic rollouts, collect (obs, action, return-to-go) and compare with critic estimates."""
+    episodes = to_pyint(episodes)
+    seed = to_pyint(seed)
+
     env = gym.make(ENV_ID)
     env.reset(seed=seed)
+
     rng = np.random.default_rng(seed)
     returns = []
     all_obs, all_act, all_rtgs = [], [], []
+
     for _ in range(episodes):
-        obs, info = env.reset(seed=rng.integers(0, 10_000))
+        ep_seed = to_pyint(rng.integers(0, 10_000, dtype=np.int64))  # <<< key line
+        obs, info = env.reset(seed=ep_seed)
+
         done = False
         traj_obs, traj_act, traj_rew = [], [], []
         while not done:
@@ -158,45 +206,41 @@ def rollout_and_bias(model, episodes=10, gamma=GAMMA, seed=SEED + 123):
             obs = next_obs
             done = terminated or truncated
 
-        # compute per-step return-to-go (MC target) for comparison
+        # MC return-to-go
         G = 0.0
         rtgs = []
         for r in reversed(traj_rew):
             G = r + gamma * G
             rtgs.append(G)
-        rtgs = list(reversed(rtgs))
+        rtgs.reverse()
+
         returns.append(sum(traj_rew))
         all_obs.extend(traj_obs)
         all_act.extend(traj_act)
         all_rtgs.extend(rtgs)
+
     env.close()
+
     all_obs = np.array(all_obs, dtype=np.float32)
     all_act = np.array(all_act, dtype=np.float32)
     all_rtgs = np.array(all_rtgs, dtype=np.float32)
 
-    # critic estimates at (s,a)
     q_est = critic_q_estimate(model, all_obs, all_act)
     if isinstance(q_est, tuple):
         q1, q2, qmin = q_est
-
-        # compare to MC return-to-go
-        bias_q1 = np.mean(q1 - all_rtgs)
-        bias_q2 = np.mean(q2 - all_rtgs)
-        bias_qmin = np.mean(qmin - all_rtgs)
         return {
             "episode_returns": returns,
             "mean_return": float(np.mean(returns)),
             "std_return": float(np.std(returns)),
-            "bias_q1": float(bias_q1),
-            "bias_q2": float(bias_q2),
-            "bias_qmin": float(bias_qmin),
+            "bias_q1": float(np.mean(q1 - all_rtgs)),
+            "bias_q2": float(np.mean(q2 - all_rtgs)),
+            "bias_qmin": float(np.mean(qmin - all_rtgs)),
         }
     else:
         q = q_est
-        bias = np.mean(q - all_rtgs)
         return {
             "episode_returns": returns,
             "mean_return": float(np.mean(returns)),
             "std_return": float(np.std(returns)),
-            "bias": float(bias),
+            "bias": float(np.mean(q - all_rtgs)),
         }
